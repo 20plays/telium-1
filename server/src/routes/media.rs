@@ -119,10 +119,14 @@ fn narrowest(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-fn earlier_of(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+/// The longer of two lifetimes, where `None` is "never expires" and so wins.
+/// Bytes are stored once and shared by every upload of them, so the row must
+/// live as long as the longest-lived claim on it: nobody's file may vanish
+/// because someone else asked for a shorter life.
+fn later_of(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     match (a, b) {
-        (Some(x), Some(y)) => Some(x.min(y)),
-        _ => None.or(a).or(b),
+        (Some(x), Some(y)) => Some(x.max(y)),
+        _ => None,
     }
 }
 
@@ -505,7 +509,7 @@ async fn store_payload(
             let (settled, promote) = match (existing_purpose == "attachment", purpose == "attachment") {
                 (true, false) => (expires_at, true),
                 (false, true) => (existing_expires, false),
-                _ => (earlier_of(existing_expires, expires_at), false),
+                _ => (later_of(existing_expires, expires_at), false),
             };
             if promote {
                 sqlx::query("UPDATE media SET purpose = ?, expires_at = ? WHERE hash = ?")

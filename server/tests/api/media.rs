@@ -1549,25 +1549,56 @@ async fn an_upload_can_be_traced_to_the_message_that_carries_it() {
 }
 
 #[tokio::test]
-async fn shared_bytes_expire_with_the_shortest_life_and_free_the_first_uploaders_quota() {
+async fn shared_bytes_live_as_long_as_the_longest_claim_on_them() {
     let s = start().await;
     let alice = s.user("alice").await;
     let bob = s.user("bob").await;
-    let a = upload_as(&s, &alice, "attachment", b"same bytes".to_vec(), &[("X-Telium-Ttl-Secs", "1")]).await;
-    let b = upload_as(&s, &bob, "attachment", b"same bytes".to_vec(), &[("X-Telium-Ttl-Secs", "2592000")]).await;
+    let short = [("X-Telium-Ttl-Secs", "1")];
+    let long = [("X-Telium-Ttl-Secs", "2592000")];
+
+    // Short first, long second: the row is extended, not left to die at 1s.
+    let a = upload_as(&s, &alice, "attachment", b"same bytes".to_vec(), &short).await;
+    let b = upload_as(&s, &bob, "attachment", b"same bytes".to_vec(), &long).await;
     let hash = a["hash"].as_str().unwrap().to_string();
     assert_eq!(a["hash"], b["hash"]);
-    assert_eq!(a["expires_at"], b["expires_at"], "the shorter life wins for both");
+    assert_eq!(b["expires_at"].as_i64(), stored_expiry(&s, &hash).await.0);
+    assert!(b["expires_at"].as_i64().unwrap() > a["expires_at"].as_i64().unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    telium_server::routes::media::sweep_expired(&s.state).await.unwrap();
+    let cap = b["capability"].as_str().unwrap();
+    let (status, _) = s.get(&format!("/_telium/v1/media/{hash}?cap={cap}"), None).await;
+    assert_eq!(status, 200, "the shorter claim expiring must not take the file with it");
+
+    // Long first, short second: the later upload never shortens the row.
+    let c = upload_as(&s, &alice, "attachment", b"other bytes".to_vec(), &long).await;
+    let h2 = c["hash"].as_str().unwrap().to_string();
+    let before = stored_expiry(&s, &h2).await.0;
+    upload_as(&s, &bob, "attachment", b"other bytes".to_vec(), &short).await;
+    assert_eq!(stored_expiry(&s, &h2).await.0, before);
+
+    // Never-expiring stays never-expiring whatever a later upload asks for.
+    let d = upload_as(&s, &alice, "attachment", b"forever bytes".to_vec(), &[]).await;
+    let h3 = d["hash"].as_str().unwrap().to_string();
+    assert_eq!(stored_expiry(&s, &h3).await.0, None);
+    upload_as(&s, &bob, "attachment", b"forever bytes".to_vec(), &short).await;
+    assert_eq!(stored_expiry(&s, &h3).await.0, None);
+    // ...and the other way round: a never-expiring upload frees a short row.
+    let e = upload_as(&s, &alice, "attachment", b"late bytes".to_vec(), &short).await;
+    let h4 = e["hash"].as_str().unwrap().to_string();
+    upload_as(&s, &bob, "attachment", b"late bytes".to_vec(), &[]).await;
+    assert_eq!(stored_expiry(&s, &h4).await.0, None);
+}
+
+#[tokio::test]
+async fn an_expired_row_is_swept_and_gives_its_owner_the_space_back() {
+    let s = start().await;
+    let alice = s.user("alice").await;
+    let a = upload_as(&s, &alice, "attachment", b"brief".to_vec(), &[("X-Telium-Ttl-Secs", "1")]).await;
     let (_, before) = s.get("/_telium/v1/account/media", Some(&alice.home)).await;
     assert_eq!(before["files"][0]["expires_at"], a["expires_at"]);
     assert!(before["used_bytes"].as_i64().unwrap() > 0);
-
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     telium_server::routes::media::sweep_expired(&s.state).await.unwrap();
-
-    let (_, list) = s.get("/_telium/v1/account/media", Some(&alice.home)).await;
-    assert_eq!(list["used_bytes"], 0, "the owner's space comes back");
-    let cap = b["capability"].as_str().unwrap();
-    let (status, _) = s.get(&format!("/_telium/v1/media/{hash}?cap={cap}"), None).await;
-    assert_eq!(status, 404);
+    let (_, after) = s.get("/_telium/v1/account/media", Some(&alice.home)).await;
+    assert_eq!(after["used_bytes"], 0);
 }
